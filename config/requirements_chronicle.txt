@@ -1,25 +1,26 @@
 # Core dependencies
-pandas>=2.0.0
-numpy>=1.24.0
-scikit-learn>=1.3.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
-joblib>=1.3.0
+pandas==2.2.0
+numpy==1.26.3
+scikit-learn==1.4.0
+matplotlib==3.8.2
+seaborn==0.13.1
+joblib==1.3.2
 
 # API dependencies
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.0.0
-python-multipart>=0.0.6
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+python-multipart==0.0.6
+slowapi==0.1.9
 
 # Google Chronicle SIEM integration
-google-auth>=2.23.0
-google-auth-httplib2>=0.1.1
-google-auth-oauthlib>=1.1.0
-requests>=2.31.0
+google-auth==2.27.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0
+requests==2.31.0
 
 # Optional: MCP support
-mcp>=0.9.0
+mcp==1.0.0
 
 # Optional: Full version with TensorFlow
 # tensorflow>=2.14.0

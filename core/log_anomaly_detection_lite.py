@@ -23,6 +23,8 @@ from datetime import datetime
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Optional
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -30,7 +32,8 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import IsolationForest
 
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=FutureWarning, module='sklearn')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 
 # ==========================================
@@ -151,7 +154,7 @@ class LogParser:
         if 'timestamp' in normalized_df.columns:
             try:
                 normalized_df['timestamp'] = pd.to_datetime(normalized_df['timestamp'], errors='coerce')
-            except:
+            except Exception:
                 normalized_df['timestamp'] = pd.NaT
 
         for col in ['user', 'event_type', 'action', 'severity']:
@@ -490,12 +493,29 @@ class AnomalyScorer:
             'isolation_forest': 0.50,  # Increased weight (no autoencoder)
             'statistical': 0.50         # Increased weight
         }
+        self._fitted_ranges: Dict[str, Tuple[float, float]] = {}
 
-    def normalize_scores(self, scores: np.ndarray) -> np.ndarray:
-        """Normalize scores to [0, 1] range."""
-        if scores.max() == scores.min():
+    def fit_normalization(self, detector_name: str, scores: np.ndarray):
+        """Store baseline (min, max) for a detector so future batches
+        use the same normalization range instead of per-batch rescaling."""
+        self._fitted_ranges[detector_name] = (float(scores.min()), float(scores.max()))
+
+    def normalize_scores(self, scores: np.ndarray, detector_name: Optional[str] = None) -> np.ndarray:
+        """Normalize scores to [0, 1] range.
+
+        If *detector_name* is given and a fitted range exists, use that range
+        for consistent normalization across batches.  Falls back to per-batch
+        min/max for backward compatibility.
+        """
+        if detector_name and detector_name in self._fitted_ranges:
+            smin, smax = self._fitted_ranges[detector_name]
+        else:
+            smin, smax = float(scores.min()), float(scores.max())
+
+        if smax == smin:
             return np.zeros_like(scores)
-        return (scores - scores.min()) / (scores.max() - scores.min())
+        normalized = (scores - smin) / (smax - smin)
+        return np.clip(normalized, 0.0, 1.0)
 
     def combine_scores(self, scores_dict: Dict[str, np.ndarray]) -> np.ndarray:
         """Weighted combination of anomaly scores."""
@@ -503,7 +523,7 @@ class AnomalyScorer:
 
         for detector_name, scores in scores_dict.items():
             if detector_name in self.weights:
-                normalized = self.normalize_scores(scores)
+                normalized = self.normalize_scores(scores, detector_name=detector_name)
                 combined += self.weights[detector_name] * normalized
 
         return combined

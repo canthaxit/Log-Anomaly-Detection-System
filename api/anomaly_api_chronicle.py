@@ -6,6 +6,7 @@ FastAPI server with automatic Chronicle SIEM forwarding
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -13,10 +14,15 @@ import joblib
 import pandas as pd
 from io import StringIO
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from typing import Literal
 import uvicorn
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Import anomaly detection components
 from log_anomaly_detection_lite import (
@@ -27,6 +33,12 @@ from log_anomaly_detection_lite import (
     preprocess_logs
 )
 from sklearn.ensemble import IsolationForest
+
+# Import security utilities
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from common.security import validate_model_path, get_verify_api_key, ALLOWED_ORIGINS
+from fastapi import Depends
 
 # Import Chronicle integration
 from google_chronicle_integration import ChronicleClient, ChronicleConfig
@@ -42,14 +54,31 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
+
+# Thread safety locks
+_model_lock = threading.Lock()
+_chronicle_lock = threading.Lock()
+
+# Enable CORS (restricted origins)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Auth dependency
+verify_api_key = get_verify_api_key()
 
 # Global state
 MODEL_STATE = {
@@ -72,19 +101,23 @@ CHRONICLE_STATE = {
 # Pydantic Models
 class LogEvent(BaseModel):
     """Single log event."""
-    timestamp: str
-    user: str
-    source_ip: str
-    dest_ip: Optional[str] = "unknown"
-    event_type: str
-    action: str
-    message: str
-    severity: Optional[str] = "low"
+    timestamp: str = Field(..., max_length=64)
+    user: str = Field(..., min_length=1, max_length=128)
+    source_ip: str = Field(..., max_length=45)
+    dest_ip: Optional[str] = Field("unknown", max_length=45)
+    event_type: str = Field(..., max_length=64)
+    action: str = Field(..., max_length=64)
+    message: str = Field(..., max_length=2048)
+    severity: Optional[Literal["low", "medium", "high", "critical"]] = "low"
+
+
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_LOG_EVENTS = 10_000
 
 
 class AnalysisRequest(BaseModel):
     """Request for log analysis."""
-    logs: List[LogEvent] = Field(..., description="List of log events to analyze")
+    logs: List[LogEvent] = Field(..., description="List of log events to analyze", max_length=MAX_LOG_EVENTS)
     return_all_events: bool = Field(False, description="Return all events with scores")
     send_to_chronicle: bool = Field(True, description="Automatically send anomalies to Chronicle")
 
@@ -180,7 +213,7 @@ async def health_check():
     }
 
 
-@app.get("/chronicle/status", response_model=ChronicleStatus)
+@app.get("/chronicle/status", response_model=ChronicleStatus, dependencies=[Depends(verify_api_key)])
 async def chronicle_status():
     """Get Chronicle integration status."""
     return ChronicleStatus(
@@ -191,9 +224,8 @@ async def chronicle_status():
     )
 
 
-@app.post("/chronicle/enable")
+@app.post("/chronicle/enable", dependencies=[Depends(verify_api_key)])
 async def enable_chronicle(
-    credentials_file: str = "chronicle_credentials.json",
     customer_id: str = None,
     region: str = "us"
 ):
@@ -202,8 +234,8 @@ async def enable_chronicle(
         # Load config
         config = ChronicleConfig()
 
-        # Use provided params or config
-        creds = credentials_file or config.get("credentials_file")
+        # Credentials file from env var only (never user-supplied)
+        creds = os.environ.get("CHRONICLE_CREDENTIALS_FILE", config.get("credentials_file"))
         cust_id = customer_id or config.get("customer_id")
         reg = region or config.get("region", "us")
 
@@ -211,7 +243,7 @@ async def enable_chronicle(
         if not Path(creds).exists():
             raise HTTPException(
                 status_code=400,
-                detail=f"Credentials file not found: {creds}"
+                detail="Chronicle credentials file not found"
             )
 
         # Initialize Chronicle client
@@ -221,13 +253,13 @@ async def enable_chronicle(
             region=reg
         )
 
-        CHRONICLE_STATE["client"] = chronicle_client
-        CHRONICLE_STATE["enabled"] = True
-        CHRONICLE_STATE["config"] = {
-            "customer_id": cust_id,
-            "region": reg,
-            "credentials_file": creds
-        }
+        with _chronicle_lock:
+            CHRONICLE_STATE["client"] = chronicle_client
+            CHRONICLE_STATE["enabled"] = True
+            CHRONICLE_STATE["config"] = {
+                "customer_id": cust_id,
+                "region": reg,
+            }
 
         logger.info("Chronicle integration enabled")
 
@@ -238,23 +270,26 @@ async def enable_chronicle(
             "region": reg
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to enable Chronicle: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to enable Chronicle integration")
 
 
-@app.post("/chronicle/disable")
+@app.post("/chronicle/disable", dependencies=[Depends(verify_api_key)])
 async def disable_chronicle():
     """Disable Chronicle integration."""
-    CHRONICLE_STATE["enabled"] = False
-    CHRONICLE_STATE["client"] = None
+    with _chronicle_lock:
+        CHRONICLE_STATE["enabled"] = False
+        CHRONICLE_STATE["client"] = None
     return {
         "status": "success",
         "message": "Chronicle integration disabled"
     }
 
 
-@app.post("/chronicle/test")
+@app.post("/chronicle/test", dependencies=[Depends(verify_api_key)])
 async def test_chronicle():
     """Test Chronicle connection."""
     if not CHRONICLE_STATE["enabled"]:
@@ -281,33 +316,39 @@ async def test_chronicle():
         result = CHRONICLE_STATE["client"].send_anomalies([test_anomaly])
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Chronicle test failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Chronicle connection test failed")
 
 
-@app.post("/models/load")
-async def load_models(model_dir: str = "anomaly_outputs"):
+@app.post("/models/load", dependencies=[Depends(verify_api_key)])
+@limiter.limit("5/minute")
+async def load_models(request: Request, model_dir: str = "anomaly_outputs"):
     """Load trained models from disk."""
     try:
-        model_path = Path(model_dir)
+        model_path = validate_model_path(model_dir)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Model directory is outside allowed paths")
 
+    try:
         if not model_path.exists():
             raise HTTPException(status_code=404, detail=f"Model directory not found: {model_dir}")
 
-        MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
-        MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
-        MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
+        with _model_lock:
+            MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
+            MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
+            MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
-        # Load inference package
-        if (model_path / "inference_package.pkl").exists():
-            package = joblib.load(model_path / "inference_package.pkl")
-            MODEL_STATE["scorer"] = package.get("scorer")
-            MODEL_STATE["threshold"] = package.get("threshold")
-        else:
-            MODEL_STATE["scorer"] = AnomalyScorer()
-            MODEL_STATE["threshold"] = 0.7
+            # Load inference package
+            if (model_path / "inference_package.pkl").exists():
+                package = joblib.load(model_path / "inference_package.pkl")
+                MODEL_STATE["scorer"] = package.get("scorer")
+                MODEL_STATE["threshold"] = package.get("threshold")
+            else:
+                MODEL_STATE["scorer"] = AnomalyScorer()
+                MODEL_STATE["threshold"] = 0.7
 
-        MODEL_STATE["loaded"] = True
-        MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
+            MODEL_STATE["loaded"] = True
+            MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
 
         logger.info(f"Models loaded successfully from {model_dir}")
 
@@ -316,7 +357,7 @@ async def load_models(model_dir: str = "anomaly_outputs"):
             config = ChronicleConfig()
             if Path(config.get("credentials_file")).exists():
                 await enable_chronicle()
-        except:
+        except Exception:
             logger.info("Chronicle auto-enable skipped (not configured)")
 
         return {
@@ -326,13 +367,16 @@ async def load_models(model_dir: str = "anomaly_outputs"):
             "chronicle_enabled": CHRONICLE_STATE["enabled"]
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to load models: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to load models: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.post("/analyze", response_model=AnalysisResponse)
-async def analyze_logs(request: AnalysisRequest, background_tasks: BackgroundTasks):
+@app.post("/analyze", response_model=AnalysisResponse, dependencies=[Depends(verify_api_key)])
+@limiter.limit("30/minute")
+async def analyze_logs(request: Request, analysis: AnalysisRequest, background_tasks: BackgroundTasks):
     """Analyze logs for anomalies and optionally send to Chronicle."""
     start_time = datetime.utcnow()
 
@@ -344,7 +388,7 @@ async def analyze_logs(request: AnalysisRequest, background_tasks: BackgroundTas
 
     try:
         # Convert request to DataFrame
-        logs_dict = [log.dict() for log in request.logs]
+        logs_dict = [log.dict() for log in analysis.logs]
         df = pd.DataFrame(logs_dict)
 
         # Preprocess
@@ -382,7 +426,7 @@ async def analyze_logs(request: AnalysisRequest, background_tasks: BackgroundTas
         is_anomaly = combined_scores > threshold
 
         # Build response
-        if request.return_all_events:
+        if analysis.return_all_events:
             result_df = df.copy()
             result_df['anomaly_score'] = combined_scores
             result_df['is_anomaly'] = is_anomaly
@@ -412,7 +456,7 @@ async def analyze_logs(request: AnalysisRequest, background_tasks: BackgroundTas
                 "threat_type": row['threat_type']
             }
 
-            if request.return_all_events or row.get('is_anomaly', True):
+            if analysis.return_all_events or row.get('is_anomaly', True):
                 anomalies.append(Anomaly(**anomaly_dict))
 
                 # Collect for Chronicle
@@ -421,7 +465,7 @@ async def analyze_logs(request: AnalysisRequest, background_tasks: BackgroundTas
 
         # Send to Chronicle in background if enabled
         chronicle_sent = False
-        if request.send_to_chronicle and anomalies_for_chronicle and CHRONICLE_STATE["enabled"]:
+        if analysis.send_to_chronicle and anomalies_for_chronicle and CHRONICLE_STATE["enabled"]:
             background_tasks.add_task(send_to_chronicle_background, anomalies_for_chronicle)
             chronicle_sent = True
 
@@ -434,18 +478,22 @@ async def analyze_logs(request: AnalysisRequest, background_tasks: BackgroundTas
             anomalies_detected=int(is_anomaly.sum()),
             anomaly_rate=float(is_anomaly.sum() / len(df)),
             threshold=float(threshold),
-            anomalies=anomalies if not request.return_all_events else [a for a in anomalies if a.anomaly_score > threshold],
+            anomalies=anomalies if not analysis.return_all_events else [a for a in anomalies if a.anomaly_score > threshold],
             processing_time_ms=processing_time,
             chronicle_sent=chronicle_sent
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.post("/analyze/file")
+@app.post("/analyze/file", dependencies=[Depends(verify_api_key)])
+@limiter.limit("10/minute")
 async def analyze_file(
+    request: Request,
     file: UploadFile = File(...),
     send_to_chronicle: bool = True,
     background_tasks: BackgroundTasks = None
@@ -458,8 +506,10 @@ async def analyze_file(
         )
 
     try:
-        # Read file
+        # Read file with size check
         content = await file.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB")
         content_str = content.decode('utf-8')
 
         # Parse based on file extension
@@ -473,34 +523,40 @@ async def analyze_file(
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format. Use JSON or CSV.")
 
+        if len(df) > MAX_LOG_EVENTS:
+            raise HTTPException(status_code=413, detail=f"Too many log events. Maximum is {MAX_LOG_EVENTS}")
+
         # Convert to request format
         logs_list = df.to_dict(orient='records')
         log_events = [LogEvent(**log) for log in logs_list]
 
         # Use existing analyze endpoint
-        request = AnalysisRequest(
+        analysis_req = AnalysisRequest(
             logs=log_events,
             send_to_chronicle=send_to_chronicle
         )
-        return await analyze_logs(request, background_tasks)
+        return await analyze_logs(request, analysis_req, background_tasks)
 
+    except HTTPException:
+        raise
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     except Exception as e:
-        logger.error(f"File analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"File analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 if __name__ == "__main__":
     # Auto-load models if available
-    if Path("anomaly_outputs").exists():
-        try:
-            MODEL_STATE["feature_pipeline"] = joblib.load("anomaly_outputs/feature_pipeline.pkl")
-            MODEL_STATE["isolation_forest"] = joblib.load("anomaly_outputs/isolation_forest_model.pkl")
-            MODEL_STATE["statistical_detector"] = joblib.load("anomaly_outputs/statistical_detector.pkl")
+    try:
+        model_path = validate_model_path("anomaly_outputs")
+        if model_path.exists():
+            MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
+            MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
+            MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
-            if Path("anomaly_outputs/inference_package.pkl").exists():
-                package = joblib.load("anomaly_outputs/inference_package.pkl")
+            if (model_path / "inference_package.pkl").exists():
+                package = joblib.load(model_path / "inference_package.pkl")
                 MODEL_STATE["scorer"] = package.get("scorer")
                 MODEL_STATE["threshold"] = package.get("threshold")
             else:
@@ -524,11 +580,13 @@ if __name__ == "__main__":
                     CHRONICLE_STATE["enabled"] = True
                     CHRONICLE_STATE["config"] = config.config
                     logger.info("Chronicle integration auto-enabled")
-            except:
+            except Exception:
                 logger.info("Chronicle auto-enable skipped (not configured)")
 
-        except Exception as e:
-            logger.warning(f"Failed to auto-load models: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to auto-load models: {e}")
 
     # Run server
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    host = os.environ.get("API_HOST", "127.0.0.1")
+    port = int(os.environ.get("API_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port, log_level="info")

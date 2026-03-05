@@ -23,6 +23,11 @@ from log_anomaly_detection_lite import (
 )
 from sklearn.ensemble import IsolationForest
 
+# Import security utilities
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from common.security import validate_model_path
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +79,7 @@ class BatchProcessor:
     def load_models(self):
         """Load trained models."""
         try:
+            self.model_dir = validate_model_path(str(self.model_dir))
             self.feature_pipeline = joblib.load(self.model_dir / "feature_pipeline.pkl")
             self.isolation_forest = joblib.load(self.model_dir / "isolation_forest_model.pkl")
             self.statistical_detector = joblib.load(self.model_dir / "statistical_detector.pkl")

@@ -6,6 +6,7 @@ FastAPI server for integration with any platform
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -14,12 +15,17 @@ import pandas as pd
 from io import StringIO
 
 try:
-    from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+    from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel, Field
+    from typing import Literal
     import uvicorn
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
 except ImportError:
-    print("FastAPI not installed. Install with: pip install fastapi uvicorn python-multipart")
+    print("FastAPI not installed. Install with: pip install fastapi uvicorn python-multipart slowapi")
     exit(1)
 
 # Import anomaly detection components
@@ -32,6 +38,12 @@ from log_anomaly_detection_lite import (
 )
 from sklearn.ensemble import IsolationForest
 
+# Import security utilities
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from common.security import validate_model_path, get_verify_api_key, ALLOWED_ORIGINS
+from fastapi import Depends
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anomaly-api")
@@ -43,14 +55,30 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
+
+# Thread safety lock for MODEL_STATE
+_model_lock = threading.Lock()
+
+# Enable CORS (restricted origins)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Auth dependency
+verify_api_key = get_verify_api_key()
 
 # Global state
 MODEL_STATE = {
@@ -67,19 +95,23 @@ MODEL_STATE = {
 # Pydantic Models
 class LogEvent(BaseModel):
     """Single log event."""
-    timestamp: str
-    user: str
-    source_ip: str
-    dest_ip: Optional[str] = "unknown"
-    event_type: str
-    action: str
-    message: str
-    severity: Optional[str] = "low"
+    timestamp: str = Field(..., max_length=64)
+    user: str = Field(..., min_length=1, max_length=128)
+    source_ip: str = Field(..., max_length=45)
+    dest_ip: Optional[str] = Field("unknown", max_length=45)
+    event_type: str = Field(..., max_length=64)
+    action: str = Field(..., max_length=64)
+    message: str = Field(..., max_length=2048)
+    severity: Optional[Literal["low", "medium", "high", "critical"]] = "low"
+
+
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_LOG_EVENTS = 10_000
 
 
 class AnalysisRequest(BaseModel):
     """Request for log analysis."""
-    logs: List[LogEvent] = Field(..., description="List of log events to analyze")
+    logs: List[LogEvent] = Field(..., description="List of log events to analyze", max_length=MAX_LOG_EVENTS)
     return_all_events: bool = Field(False, description="Return all events with scores, not just anomalies")
 
 
@@ -162,7 +194,7 @@ async def health_check():
     )
 
 
-@app.get("/models/info", response_model=ModelInfo)
+@app.get("/models/info", response_model=ModelInfo, dependencies=[Depends(verify_api_key)])
 async def get_model_info():
     """Get information about loaded models."""
     if not MODEL_STATE["loaded"]:
@@ -177,30 +209,35 @@ async def get_model_info():
     )
 
 
-@app.post("/models/load")
-async def load_models(model_dir: str = "anomaly_outputs"):
+@app.post("/models/load", dependencies=[Depends(verify_api_key)])
+@limiter.limit("5/minute")
+async def load_models(request: Request, model_dir: str = "anomaly_outputs"):
     """Load trained models from disk."""
     try:
-        model_path = Path(model_dir)
+        model_path = validate_model_path(model_dir)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Model directory is outside allowed paths")
 
+    try:
         if not model_path.exists():
             raise HTTPException(status_code=404, detail=f"Model directory not found: {model_dir}")
 
-        MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
-        MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
-        MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
+        with _model_lock:
+            MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
+            MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
+            MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
-        # Load inference package
-        if (model_path / "inference_package.pkl").exists():
-            package = joblib.load(model_path / "inference_package.pkl")
-            MODEL_STATE["scorer"] = package.get("scorer")
-            MODEL_STATE["threshold"] = package.get("threshold")
-        else:
-            MODEL_STATE["scorer"] = AnomalyScorer()
-            MODEL_STATE["threshold"] = 0.7
+            # Load inference package
+            if (model_path / "inference_package.pkl").exists():
+                package = joblib.load(model_path / "inference_package.pkl")
+                MODEL_STATE["scorer"] = package.get("scorer")
+                MODEL_STATE["threshold"] = package.get("threshold")
+            else:
+                MODEL_STATE["scorer"] = AnomalyScorer()
+                MODEL_STATE["threshold"] = 0.7
 
-        MODEL_STATE["loaded"] = True
-        MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
+            MODEL_STATE["loaded"] = True
+            MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
 
         logger.info(f"Models loaded successfully from {model_dir}")
 
@@ -210,13 +247,16 @@ async def load_models(model_dir: str = "anomaly_outputs"):
             "loaded_at": MODEL_STATE["loaded_at"]
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to load models: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to load models: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.post("/analyze", response_model=AnalysisResponse)
-async def analyze_logs(request: AnalysisRequest):
+@app.post("/analyze", response_model=AnalysisResponse, dependencies=[Depends(verify_api_key)])
+@limiter.limit("30/minute")
+async def analyze_logs(request: Request, analysis: AnalysisRequest):
     """Analyze logs for anomalies."""
     start_time = datetime.utcnow()
 
@@ -228,7 +268,7 @@ async def analyze_logs(request: AnalysisRequest):
 
     try:
         # Convert request to DataFrame
-        logs_dict = [log.dict() for log in request.logs]
+        logs_dict = [log.dict() for log in analysis.logs]
         df = pd.DataFrame(logs_dict)
 
         # Preprocess
@@ -265,7 +305,7 @@ async def analyze_logs(request: AnalysisRequest):
         is_anomaly = combined_scores > threshold
 
         # Build response
-        if request.return_all_events:
+        if analysis.return_all_events:
             result_df = df.copy()
             result_df['anomaly_score'] = combined_scores
             result_df['is_anomaly'] = is_anomaly
@@ -280,7 +320,7 @@ async def analyze_logs(request: AnalysisRequest):
         # Convert to response format
         anomalies = []
         for _, row in result_df.iterrows():
-            if request.return_all_events or row.get('is_anomaly', True):
+            if analysis.return_all_events or row.get('is_anomaly', True):
                 anomalies.append(Anomaly(
                     timestamp=str(row['timestamp']),
                     user=row['user'],
@@ -303,17 +343,20 @@ async def analyze_logs(request: AnalysisRequest):
             anomalies_detected=int(is_anomaly.sum()),
             anomaly_rate=float(is_anomaly.sum() / len(df)),
             threshold=float(threshold),
-            anomalies=anomalies if not request.return_all_events else [a for a in anomalies if a.anomaly_score > threshold],
+            anomalies=anomalies if not analysis.return_all_events else [a for a in anomalies if a.anomaly_score > threshold],
             processing_time_ms=processing_time
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.post("/analyze/file")
-async def analyze_file(file: UploadFile = File(...)):
+@app.post("/analyze/file", dependencies=[Depends(verify_api_key)])
+@limiter.limit("10/minute")
+async def analyze_file(request: Request, file: UploadFile = File(...)):
     """Analyze logs from uploaded file."""
     if not MODEL_STATE["loaded"]:
         raise HTTPException(
@@ -322,8 +365,10 @@ async def analyze_file(file: UploadFile = File(...)):
         )
 
     try:
-        # Read file
+        # Read file with size check
         content = await file.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB")
         content_str = content.decode('utf-8')
 
         # Parse based on file extension
@@ -337,22 +382,27 @@ async def analyze_file(file: UploadFile = File(...)):
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format. Use JSON or CSV.")
 
+        if len(df) > MAX_LOG_EVENTS:
+            raise HTTPException(status_code=413, detail=f"Too many log events. Maximum is {MAX_LOG_EVENTS}")
+
         # Convert to request format
         logs_list = df.to_dict(orient='records')
         log_events = [LogEvent(**log) for log in logs_list]
 
         # Use existing analyze endpoint
-        request = AnalysisRequest(logs=log_events)
-        return await analyze_logs(request)
+        analysis_req = AnalysisRequest(logs=log_events)
+        return await analyze_logs(request, analysis_req)
 
+    except HTTPException:
+        raise
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     except Exception as e:
-        logger.error(f"File analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"File analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(verify_api_key)])
 async def get_statistics():
     """Get system statistics."""
     if not MODEL_STATE["loaded"]:
@@ -375,14 +425,15 @@ async def get_statistics():
 
 if __name__ == "__main__":
     # Auto-load models if available
-    if Path("anomaly_outputs").exists():
-        try:
-            MODEL_STATE["feature_pipeline"] = joblib.load("anomaly_outputs/feature_pipeline.pkl")
-            MODEL_STATE["isolation_forest"] = joblib.load("anomaly_outputs/isolation_forest_model.pkl")
-            MODEL_STATE["statistical_detector"] = joblib.load("anomaly_outputs/statistical_detector.pkl")
+    try:
+        model_path = validate_model_path("anomaly_outputs")
+        if model_path.exists():
+            MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
+            MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
+            MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
-            if Path("anomaly_outputs/inference_package.pkl").exists():
-                package = joblib.load("anomaly_outputs/inference_package.pkl")
+            if (model_path / "inference_package.pkl").exists():
+                package = joblib.load(model_path / "inference_package.pkl")
                 MODEL_STATE["scorer"] = package.get("scorer")
                 MODEL_STATE["threshold"] = package.get("threshold")
             else:
@@ -392,8 +443,10 @@ if __name__ == "__main__":
             MODEL_STATE["loaded"] = True
             MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
             logger.info("Models auto-loaded successfully")
-        except Exception as e:
-            logger.warning(f"Failed to auto-load models: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to auto-load models: {e}")
 
     # Run server
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    host = os.environ.get("API_HOST", "127.0.0.1")
+    port = int(os.environ.get("API_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port, log_level="info")

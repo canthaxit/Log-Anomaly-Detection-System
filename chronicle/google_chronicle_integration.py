@@ -43,6 +43,11 @@ class ChronicleClient:
             region: Chronicle region (us, europe, asia)
             log_type: Log type for Chronicle ingestion
         """
+        if customer_id == "YOUR_CUSTOMER_ID":
+            raise ValueError(
+                "Chronicle customer_id is still set to the placeholder 'YOUR_CUSTOMER_ID'. "
+                "Please configure a real customer ID."
+            )
         self.customer_id = customer_id
         self.log_type = log_type
 
@@ -72,7 +77,7 @@ class ChronicleClient:
         # Parse timestamp
         try:
             timestamp = datetime.fromisoformat(anomaly['timestamp'].replace('Z', '+00:00'))
-        except:
+        except Exception:
             timestamp = datetime.utcnow()
 
         # Map severity to UDM severity

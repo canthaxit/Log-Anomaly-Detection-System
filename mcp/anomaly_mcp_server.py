@@ -32,6 +32,11 @@ from log_anomaly_detection_lite import (
 )
 from sklearn.ensemble import IsolationForest
 
+# Import security utilities
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from common.security import validate_model_path, validate_log_path
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anomaly-mcp-server")
@@ -53,8 +58,12 @@ MODEL_STATE = {
 def load_models(model_dir: str = "anomaly_outputs") -> Dict[str, Any]:
     """Load trained models from disk."""
     try:
-        model_path = Path(model_dir)
+        model_path = validate_model_path(model_dir)
+    except ValueError as exc:
+        logger.error(f"Model path validation failed: {exc}")
+        return {"status": "error", "message": "Model directory is outside allowed paths"}
 
+    try:
         MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
         MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
         MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
@@ -75,7 +84,7 @@ def load_models(model_dir: str = "anomaly_outputs") -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Failed to load models"}
 
 
 def analyze_logs(log_data: str, format: str = "json") -> Dict[str, Any]:
@@ -152,8 +161,8 @@ def analyze_logs(log_data: str, format: str = "json") -> Dict[str, Any]:
         }
 
     except Exception as e:
-        logger.error(f"Analysis failed: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        return {"status": "error", "message": "Analysis failed"}
 
 
 def classify_threat(row: pd.Series, detector: StatisticalAnomalyDetector) -> str:
@@ -186,7 +195,11 @@ def assign_severity(score: float) -> str:
 def analyze_log_file(filepath: str) -> Dict[str, Any]:
     """Analyze logs from a file."""
     try:
-        path = Path(filepath)
+        path = validate_log_path(filepath)
+    except ValueError:
+        return {"status": "error", "message": "File path is outside allowed directories"}
+
+    try:
         if not path.exists():
             return {"status": "error", "message": f"File not found: {filepath}"}
 
@@ -200,7 +213,7 @@ def analyze_log_file(filepath: str) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"File analysis failed: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "File analysis failed"}
 
 
 def get_stats() -> Dict[str, Any]:
@@ -223,7 +236,8 @@ def get_stats() -> Dict[str, Any]:
             }
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Stats retrieval failed: {e}", exc_info=True)
+        return {"status": "error", "message": "Failed to retrieve stats"}
 
 
 # MCP Tool Definitions
@@ -317,10 +331,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         )]
 
     except Exception as e:
-        logger.error(f"Tool execution failed: {e}")
+        logger.error(f"Tool execution failed: {e}", exc_info=True)
         return [TextContent(
             type="text",
-            text=json.dumps({"status": "error", "message": str(e)}, indent=2)
+            text=json.dumps({"status": "error", "message": "Tool execution failed"}, indent=2)
         )]
 
 
@@ -329,8 +343,12 @@ async def main():
     logger.info("Starting Log Anomaly Detection MCP Server")
 
     # Auto-load models if available
-    if Path("anomaly_outputs").exists():
-        load_models("anomaly_outputs")
+    try:
+        validated = validate_model_path("anomaly_outputs")
+        if validated.exists():
+            load_models("anomaly_outputs")
+    except ValueError:
+        logger.warning("Default model dir not in allowed paths, skipping auto-load")
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())

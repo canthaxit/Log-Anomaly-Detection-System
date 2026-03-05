@@ -22,9 +22,18 @@ RUN pip install --no-cache-dir -r requirements_api.txt
 # Copy application files
 COPY log_anomaly_detection_lite.py .
 COPY anomaly_api.py .
+COPY common/ common/
 
 # Create directories
 RUN mkdir -p anomaly_outputs logs
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /bin/false appuser
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Default to binding on all interfaces inside container
+ENV API_HOST=0.0.0.0
 
 # Expose API port
 EXPOSE 8000

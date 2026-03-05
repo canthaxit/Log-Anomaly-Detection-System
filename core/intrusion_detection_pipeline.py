@@ -26,6 +26,8 @@ from datetime import datetime
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Optional
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -42,7 +44,8 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Learnin
 from tensorflow.keras.regularizers import l2
 
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=FutureWarning, module='sklearn')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 
 # ==========================================
