@@ -259,16 +259,34 @@ class ChronicleClient:
                 "message": str(e)
             }
 
+    @staticmethod
+    def _sanitize_yara_value(s: str, max_len: int = 128) -> str:
+        """Sanitize a string for safe interpolation into YARA-L rules.
+
+        Strips characters that could break rule syntax or inject logic.
+        """
+        # Remove dangerous characters
+        for ch in ('"', '{', '}', '\\', '\n', '\r', ';'):
+            s = s.replace(ch, '')
+        return s[:max_len]
+
     def _build_yara_l_rule(self, config: Dict[str, Any]) -> str:
         """Build YARA-L rule for Chronicle detection."""
         severity = config.get("min_severity", "MEDIUM")
         score = config.get("min_score", 0.7)
 
+        name = self._sanitize_yara_value(
+            config.get("name", "anomaly_detection")
+        ).replace(" ", "_")
+        description = self._sanitize_yara_value(
+            config.get("description", "Detect security anomalies")
+        )
+
         rule = f'''
-rule {config.get("name", "anomaly_detection").replace(" ", "_")} {{
+rule {name} {{
   meta:
     author = "Anomaly Detection System"
-    description = "{config.get("description", "Detect security anomalies")}"
+    description = "{description}"
     severity = "{severity}"
 
   events:

@@ -13,6 +13,9 @@ pydantic==2.5.3
 python-multipart==0.0.6
 slowapi==0.1.9
 
+# HTTP client
+requests==2.31.0
+
 # MCP dependencies
 mcp==1.0.0
 

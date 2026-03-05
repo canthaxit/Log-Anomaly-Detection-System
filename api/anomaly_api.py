@@ -40,8 +40,10 @@ from sklearn.ensemble import IsolationForest
 
 # Import security utilities
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from common.security import validate_model_path, get_verify_api_key, ALLOWED_ORIGINS
+_parent = os.path.join(os.path.dirname(__file__), '..')
+if os.path.isfile(os.path.join(_parent, 'common', 'security.py')):
+    sys.path.insert(0, _parent)
+from common.security import validate_model_path, verify_model_file, get_verify_api_key, ALLOWED_ORIGINS
 from fastapi import Depends
 
 # Configure logging
@@ -74,8 +76,18 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "X-API-Key", "Accept"],
 )
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 # Auth dependency
 verify_api_key = get_verify_api_key()
@@ -195,17 +207,20 @@ async def health_check():
 
 
 @app.get("/models/info", response_model=ModelInfo, dependencies=[Depends(verify_api_key)])
-async def get_model_info():
+@limiter.limit("30/minute")
+async def get_model_info(request: Request):
     """Get information about loaded models."""
-    if not MODEL_STATE["loaded"]:
+    with _model_lock:
+        snapshot = dict(MODEL_STATE)
+    if not snapshot["loaded"]:
         return ModelInfo(loaded=False, loaded_at=None, threshold=None, n_features=None, feature_names=None)
 
     return ModelInfo(
         loaded=True,
-        loaded_at=MODEL_STATE["loaded_at"],
-        threshold=float(MODEL_STATE["threshold"]) if MODEL_STATE["threshold"] else None,
-        n_features=len(MODEL_STATE["feature_pipeline"].feature_names_),
-        feature_names=MODEL_STATE["feature_pipeline"].feature_names_
+        loaded_at=snapshot["loaded_at"],
+        threshold=float(snapshot["threshold"]) if snapshot["threshold"] else None,
+        n_features=len(snapshot["feature_pipeline"].feature_names_),
+        feature_names=snapshot["feature_pipeline"].feature_names_
     )
 
 
@@ -220,15 +235,18 @@ async def load_models(request: Request, model_dir: str = "anomaly_outputs"):
 
     try:
         if not model_path.exists():
-            raise HTTPException(status_code=404, detail=f"Model directory not found: {model_dir}")
+            raise HTTPException(status_code=404, detail="Model directory not found")
 
         with _model_lock:
+            for pkl in ("feature_pipeline.pkl", "isolation_forest_model.pkl", "statistical_detector.pkl"):
+                verify_model_file(model_path / pkl)
             MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
             MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
             MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
             # Load inference package
             if (model_path / "inference_package.pkl").exists():
+                verify_model_file(model_path / "inference_package.pkl")
                 package = joblib.load(model_path / "inference_package.pkl")
                 MODEL_STATE["scorer"] = package.get("scorer")
                 MODEL_STATE["threshold"] = package.get("threshold")
@@ -260,7 +278,11 @@ async def analyze_logs(request: Request, analysis: AnalysisRequest):
     """Analyze logs for anomalies."""
     start_time = datetime.utcnow()
 
-    if not MODEL_STATE["loaded"]:
+    # Atomic snapshot of MODEL_STATE
+    with _model_lock:
+        model_snap = dict(MODEL_STATE)
+
+    if not model_snap["loaded"]:
         raise HTTPException(
             status_code=400,
             detail="Models not loaded. Call POST /models/load first."
@@ -282,26 +304,26 @@ async def analyze_logs(request: Request, analysis: AnalysisRequest):
                 total_events=0,
                 anomalies_detected=0,
                 anomaly_rate=0.0,
-                threshold=float(MODEL_STATE["threshold"]),
+                threshold=float(model_snap["threshold"]),
                 anomalies=[],
                 processing_time_ms=0.0
             )
 
         # Extract features
-        features = MODEL_STATE["feature_pipeline"].transform(df)
+        features = model_snap["feature_pipeline"].transform(df)
 
         # Detect anomalies
-        iso_scores = -MODEL_STATE["isolation_forest"].score_samples(features)
-        stat_scores = MODEL_STATE["statistical_detector"].detect_all(df)
+        iso_scores = -model_snap["isolation_forest"].score_samples(features)
+        stat_scores = model_snap["statistical_detector"].detect_all(df)
 
         # Combine scores
-        combined_scores = MODEL_STATE["scorer"].combine_scores({
+        combined_scores = model_snap["scorer"].combine_scores({
             'isolation_forest': iso_scores,
             'statistical': stat_scores
         })
 
         # Identify anomalies
-        threshold = MODEL_STATE["threshold"]
+        threshold = model_snap["threshold"]
         is_anomaly = combined_scores > threshold
 
         # Build response
@@ -371,6 +393,10 @@ async def analyze_file(request: Request, file: UploadFile = File(...)):
             raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB")
         content_str = content.decode('utf-8')
 
+        # Null filename check
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No filename provided")
+
         # Parse based on file extension
         if file.filename.endswith('.json'):
             logs = json.loads(content_str)
@@ -379,6 +405,8 @@ async def analyze_file(request: Request, file: UploadFile = File(...)):
             df = pd.DataFrame(logs)
         elif file.filename.endswith('.csv'):
             df = pd.read_csv(StringIO(content_str))
+            if len(df.columns) > 50:
+                raise HTTPException(status_code=400, detail="CSV has too many columns (max 50)")
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format. Use JSON or CSV.")
 
@@ -403,22 +431,25 @@ async def analyze_file(request: Request, file: UploadFile = File(...)):
 
 
 @app.get("/stats", dependencies=[Depends(verify_api_key)])
-async def get_statistics():
+@limiter.limit("30/minute")
+async def get_statistics(request: Request):
     """Get system statistics."""
-    if not MODEL_STATE["loaded"]:
+    with _model_lock:
+        snapshot = dict(MODEL_STATE)
+    if not snapshot["loaded"]:
         raise HTTPException(status_code=400, detail="Models not loaded")
 
     return {
         "models_loaded": True,
-        "loaded_at": MODEL_STATE["loaded_at"],
-        "threshold": float(MODEL_STATE["threshold"]),
+        "loaded_at": snapshot["loaded_at"],
+        "threshold": float(snapshot["threshold"]),
         "isolation_forest": {
-            "n_estimators": MODEL_STATE["isolation_forest"].n_estimators,
-            "contamination": MODEL_STATE["isolation_forest"].contamination
+            "n_estimators": snapshot["isolation_forest"].n_estimators,
+            "contamination": snapshot["isolation_forest"].contamination
         },
         "features": {
-            "count": len(MODEL_STATE["feature_pipeline"].feature_names_),
-            "names": MODEL_STATE["feature_pipeline"].feature_names_
+            "count": len(snapshot["feature_pipeline"].feature_names_),
+            "names": snapshot["feature_pipeline"].feature_names_
         }
     }
 
@@ -428,20 +459,24 @@ if __name__ == "__main__":
     try:
         model_path = validate_model_path("anomaly_outputs")
         if model_path.exists():
-            MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
-            MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
-            MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
+            for pkl in ("feature_pipeline.pkl", "isolation_forest_model.pkl", "statistical_detector.pkl"):
+                verify_model_file(model_path / pkl)
+            with _model_lock:
+                MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
+                MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
+                MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
-            if (model_path / "inference_package.pkl").exists():
-                package = joblib.load(model_path / "inference_package.pkl")
-                MODEL_STATE["scorer"] = package.get("scorer")
-                MODEL_STATE["threshold"] = package.get("threshold")
-            else:
-                MODEL_STATE["scorer"] = AnomalyScorer()
-                MODEL_STATE["threshold"] = 0.7
+                if (model_path / "inference_package.pkl").exists():
+                    verify_model_file(model_path / "inference_package.pkl")
+                    package = joblib.load(model_path / "inference_package.pkl")
+                    MODEL_STATE["scorer"] = package.get("scorer")
+                    MODEL_STATE["threshold"] = package.get("threshold")
+                else:
+                    MODEL_STATE["scorer"] = AnomalyScorer()
+                    MODEL_STATE["threshold"] = 0.7
 
-            MODEL_STATE["loaded"] = True
-            MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
+                MODEL_STATE["loaded"] = True
+                MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
             logger.info("Models auto-loaded successfully")
     except Exception as e:
         logger.warning(f"Failed to auto-load models: {e}")

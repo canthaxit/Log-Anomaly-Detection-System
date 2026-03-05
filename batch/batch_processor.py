@@ -25,8 +25,10 @@ from sklearn.ensemble import IsolationForest
 
 # Import security utilities
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from common.security import validate_model_path
+_parent = os.path.join(os.path.dirname(__file__), '..')
+if os.path.isfile(os.path.join(_parent, 'common', 'security.py')):
+    sys.path.insert(0, _parent)
+from common.security import validate_model_path, validate_log_path, verify_model_file
 
 # Configure logging
 logging.basicConfig(
@@ -47,7 +49,12 @@ class BatchProcessor:
         interval: int = 3600
     ):
         self.model_dir = Path(model_dir)
-        self.log_dir = Path(log_dir)
+        # Validate log_dir is within allowed directories
+        try:
+            self.log_dir = validate_log_path(log_dir)
+        except ValueError:
+            logger.error(f"Log directory is outside allowed paths")
+            raise
         self.output_dir = Path(output_dir)
         self.interval = interval
 
@@ -80,11 +87,14 @@ class BatchProcessor:
         """Load trained models."""
         try:
             self.model_dir = validate_model_path(str(self.model_dir))
+            for pkl in ("feature_pipeline.pkl", "isolation_forest_model.pkl", "statistical_detector.pkl"):
+                verify_model_file(self.model_dir / pkl)
             self.feature_pipeline = joblib.load(self.model_dir / "feature_pipeline.pkl")
             self.isolation_forest = joblib.load(self.model_dir / "isolation_forest_model.pkl")
             self.statistical_detector = joblib.load(self.model_dir / "statistical_detector.pkl")
 
             if (self.model_dir / "inference_package.pkl").exists():
+                verify_model_file(self.model_dir / "inference_package.pkl")
                 package = joblib.load(self.model_dir / "inference_package.pkl")
                 self.scorer = package.get("scorer")
                 self.threshold = package.get("threshold")
@@ -197,8 +207,8 @@ class BatchProcessor:
             }
 
         except Exception as e:
-            logger.error(f"Failed to process {filepath}: {e}")
-            return {"status": "error", "filepath": str(filepath), "error": str(e)}
+            logger.error(f"Failed to process {filepath}: {e}", exc_info=True)
+            return {"status": "error", "filepath": str(filepath), "error": "Processing failed"}
 
     def classify_threat(self, row: pd.Series) -> str:
         """Classify threat type."""

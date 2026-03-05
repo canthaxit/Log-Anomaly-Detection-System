@@ -34,8 +34,10 @@ from sklearn.ensemble import IsolationForest
 
 # Import security utilities
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from common.security import validate_model_path, validate_log_path
+_parent = os.path.join(os.path.dirname(__file__), '..')
+if os.path.isfile(os.path.join(_parent, 'common', 'security.py')):
+    sys.path.insert(0, _parent)
+from common.security import validate_model_path, validate_log_path, verify_model_file
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +45,11 @@ logger = logging.getLogger("anomaly-mcp-server")
 
 # Initialize MCP server
 app = Server("log-anomaly-detection")
+
+# Input size limits
+MAX_INPUT_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_LOG_EVENTS = 10_000
+MAX_CSV_COLUMNS = 50
 
 # Global state for loaded models
 MODEL_STATE = {
@@ -64,12 +71,15 @@ def load_models(model_dir: str = "anomaly_outputs") -> Dict[str, Any]:
         return {"status": "error", "message": "Model directory is outside allowed paths"}
 
     try:
+        for pkl in ("feature_pipeline.pkl", "isolation_forest_model.pkl", "statistical_detector.pkl"):
+            verify_model_file(model_path / pkl)
         MODEL_STATE["feature_pipeline"] = joblib.load(model_path / "feature_pipeline.pkl")
         MODEL_STATE["isolation_forest"] = joblib.load(model_path / "isolation_forest_model.pkl")
         MODEL_STATE["statistical_detector"] = joblib.load(model_path / "statistical_detector.pkl")
 
         # Load inference package if available
         if (model_path / "inference_package.pkl").exists():
+            verify_model_file(model_path / "inference_package.pkl")
             package = joblib.load(model_path / "inference_package.pkl")
             MODEL_STATE["scorer"] = package.get("scorer")
             MODEL_STATE["threshold"] = package.get("threshold")
@@ -93,15 +103,23 @@ def analyze_logs(log_data: str, format: str = "json") -> Dict[str, Any]:
         return {"status": "error", "message": "Models not loaded. Call load_models first."}
 
     try:
+        # Input size check
+        if len(log_data) > MAX_INPUT_SIZE:
+            return {"status": "error", "message": f"Input too large (max {MAX_INPUT_SIZE // (1024*1024)} MB)"}
+
         # Parse log data
         if format == "json":
             logs = json.loads(log_data)
             if isinstance(logs, dict):
                 logs = [logs]
+            if len(logs) > MAX_LOG_EVENTS:
+                return {"status": "error", "message": f"Too many log events (max {MAX_LOG_EVENTS})"}
             df = pd.DataFrame(logs)
         elif format == "csv":
             from io import StringIO
             df = pd.read_csv(StringIO(log_data))
+            if len(df.columns) > MAX_CSV_COLUMNS:
+                return {"status": "error", "message": f"CSV has too many columns (max {MAX_CSV_COLUMNS})"}
         else:
             return {"status": "error", "message": f"Unsupported format: {format}"}
 
