@@ -1,0 +1,31 @@
+[project]
+name = "log-anomaly-detection-system"
+version = "1.0.0"
+description = "AI-powered log anomaly detection for security threat identification"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "core"]
+markers = [
+    "slow: marks tests as slow (>5s)",
+]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["core", "common", "api", "batch", "mcp"]
+omit = [
+    "core/intrusion_detection_pipeline.py",
+    "api/anomaly_api_chronicle.py",
+    "api/test_api.py",
+    "mcp/anomaly_mcp_server.py",
+]
+
+[tool.coverage.report]
+fail_under = 55
+show_missing = true
+exclude_lines = [
+    "if __name__",
+    "pragma: no cover",
+    "exit\\(1\\)",
+]
