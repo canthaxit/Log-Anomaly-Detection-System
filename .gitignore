@@ -205,3 +205,6 @@ desktop.ini
 # Temporary files
 *.tmp
 *.temp
+
+# Git worktrees
+.worktrees/
