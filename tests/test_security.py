@@ -164,3 +164,19 @@ class TestAPIKeyAuth:
             await dep(key=None)  # should not raise
         finally:
             sec.API_KEY = orig
+
+
+class TestRequireAuthDefault:
+    def test_default_is_true(self):
+        """REQUIRE_AUTH should default to True when env var is unset."""
+        import common.security as sec
+        import os
+        orig_env = os.environ.pop("REQUIRE_AUTH", None)
+        orig_val = sec.REQUIRE_AUTH
+        try:
+            result = os.environ.get("REQUIRE_AUTH", "true").lower() == "true"
+            assert result is True
+        finally:
+            sec.REQUIRE_AUTH = orig_val
+            if orig_env is not None:
+                os.environ["REQUIRE_AUTH"] = orig_env

@@ -25,6 +25,7 @@ for _p in [str(_project_root), str(_core_dir)]:
 # Set env vars BEFORE importing security (it reads them at import time)
 os.environ.setdefault("ALLOWED_MODEL_DIRS", "anomaly_outputs,tests/tmp_models")
 os.environ.setdefault("ALLOWED_LOG_DIRS", "logs,tests")
+os.environ.setdefault("REQUIRE_AUTH", "false")
 
 # Now safe to import project modules
 from log_anomaly_detection_lite import (
