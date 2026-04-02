@@ -44,7 +44,12 @@ _parent = os.path.join(os.path.dirname(__file__), '..')
 if os.path.isfile(os.path.join(_parent, 'common', 'security.py')):
     sys.path.insert(0, _parent)
 from common.security import validate_model_path, verify_model_file, get_verify_api_key, ALLOWED_ORIGINS
+from common.config import MAX_UPLOAD_SIZE, MAX_LOG_EVENTS, RATE_LIMITS, DEFAULT_THRESHOLD
+from common.threats import ThreatClassifier
+from common.sanitize import sanitize_message
 from fastapi import Depends
+
+_classifier = ThreatClassifier()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -117,10 +122,6 @@ class LogEvent(BaseModel):
     severity: Optional[Literal["low", "medium", "high", "critical"]] = "low"
 
 
-MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
-MAX_LOG_EVENTS = 10_000
-
-
 class AnalysisRequest(BaseModel):
     """Request for log analysis."""
     logs: List[LogEvent] = Field(..., description="List of log events to analyze", max_length=MAX_LOG_EVENTS)
@@ -168,33 +169,6 @@ class HealthResponse(BaseModel):
     timestamp: str
 
 
-# Utility Functions
-def classify_threat(row: pd.Series) -> str:
-    """Classify threat type."""
-    if 'failed' in str(row.get('action', '')).lower():
-        return 'brute_force'
-    elif 'sudo' in str(row.get('message', '')).lower():
-        return 'privilege_escalation'
-    elif any(word in str(row.get('message', '')).lower() for word in ['shadow', 'passwd', 'secret']):
-        return 'data_exfiltration'
-    elif row.get('event_type') == 'network':
-        return 'lateral_movement'
-    else:
-        return 'unknown'
-
-
-def assign_severity(score: float) -> str:
-    """Assign severity based on score."""
-    if score >= 0.95:
-        return 'critical'
-    elif score >= 0.85:
-        return 'high'
-    elif score >= 0.7:
-        return 'medium'
-    else:
-        return 'low'
-
-
 # API Endpoints
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -207,7 +181,7 @@ async def health_check():
 
 
 @app.get("/models/info", response_model=ModelInfo, dependencies=[Depends(verify_api_key)])
-@limiter.limit("30/minute")
+@limiter.limit(RATE_LIMITS["default"])
 async def get_model_info(request: Request):
     """Get information about loaded models."""
     with _model_lock:
@@ -225,7 +199,7 @@ async def get_model_info(request: Request):
 
 
 @app.post("/models/load", dependencies=[Depends(verify_api_key)])
-@limiter.limit("5/minute")
+@limiter.limit(RATE_LIMITS["models_load"])
 async def load_models(request: Request, model_dir: str = "anomaly_outputs"):
     """Load trained models from disk."""
     try:
@@ -252,7 +226,7 @@ async def load_models(request: Request, model_dir: str = "anomaly_outputs"):
                 MODEL_STATE["threshold"] = package.get("threshold")
             else:
                 MODEL_STATE["scorer"] = AnomalyScorer()
-                MODEL_STATE["threshold"] = 0.7
+                MODEL_STATE["threshold"] = DEFAULT_THRESHOLD
 
             MODEL_STATE["loaded"] = True
             MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
@@ -273,7 +247,7 @@ async def load_models(request: Request, model_dir: str = "anomaly_outputs"):
 
 
 @app.post("/analyze", response_model=AnalysisResponse, dependencies=[Depends(verify_api_key)])
-@limiter.limit("30/minute")
+@limiter.limit(RATE_LIMITS["analyze"])
 async def analyze_logs(request: Request, analysis: AnalysisRequest):
     """Analyze logs for anomalies."""
     start_time = datetime.utcnow()
@@ -336,8 +310,8 @@ async def analyze_logs(request: Request, analysis: AnalysisRequest):
             result_df['anomaly_score'] = combined_scores[is_anomaly]
 
         # Classify threats and assign severity
-        result_df['threat_type'] = result_df.apply(classify_threat, axis=1)
-        result_df['severity'] = result_df['anomaly_score'].apply(assign_severity)
+        result_df['threat_type'] = result_df.apply(_classifier.classify_threat, axis=1)
+        result_df['severity'] = result_df['anomaly_score'].apply(_classifier.assign_severity)
 
         # Convert to response format
         anomalies = []
@@ -350,7 +324,7 @@ async def analyze_logs(request: Request, analysis: AnalysisRequest):
                     dest_ip=row.get('dest_ip', 'unknown'),
                     event_type=row['event_type'],
                     action=row['action'],
-                    message=row['message'],
+                    message=sanitize_message(str(row['message'])),
                     severity=row['severity'],
                     anomaly_score=float(row['anomaly_score']),
                     threat_type=row['threat_type']
@@ -377,7 +351,7 @@ async def analyze_logs(request: Request, analysis: AnalysisRequest):
 
 
 @app.post("/analyze/file", dependencies=[Depends(verify_api_key)])
-@limiter.limit("10/minute")
+@limiter.limit(RATE_LIMITS["analyze_file"])
 async def analyze_file(request: Request, file: UploadFile = File(...)):
     """Analyze logs from uploaded file."""
     if not MODEL_STATE["loaded"]:
@@ -431,7 +405,7 @@ async def analyze_file(request: Request, file: UploadFile = File(...)):
 
 
 @app.get("/stats", dependencies=[Depends(verify_api_key)])
-@limiter.limit("30/minute")
+@limiter.limit(RATE_LIMITS["default"])
 async def get_statistics(request: Request):
     """Get system statistics."""
     with _model_lock:
@@ -473,7 +447,7 @@ if __name__ == "__main__":
                     MODEL_STATE["threshold"] = package.get("threshold")
                 else:
                     MODEL_STATE["scorer"] = AnomalyScorer()
-                    MODEL_STATE["threshold"] = 0.7
+                    MODEL_STATE["threshold"] = DEFAULT_THRESHOLD
 
                 MODEL_STATE["loaded"] = True
                 MODEL_STATE["loaded_at"] = datetime.utcnow().isoformat()
