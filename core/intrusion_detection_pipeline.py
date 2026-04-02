@@ -14,6 +14,14 @@ Key Features:
 Author: Transformed for log anomaly detection
 """
 
+import warnings
+warnings.warn(
+    "intrusion_detection_pipeline is deprecated. Use log_anomaly_detection_lite "
+    "with core.autoencoder for TensorFlow support.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import pandas as pd
 import numpy as np
 import glob

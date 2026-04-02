@@ -1,0 +1,3 @@
+# Full dependencies (includes TensorFlow for autoencoder support)
+-r requirements_api.txt
+tensorflow>=2.14.0
