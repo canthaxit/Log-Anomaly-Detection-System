@@ -396,6 +396,8 @@ class StatisticalAnomalyDetector:
         self.brute_force_threshold = 10
         self.sudo_threshold = 5
         self.user_baselines_ = None
+        self.honeytoken_users = ['svc_wmt_staging_admin', 'sys_pos_backup', 'wmt_supply_service']
+        self.honeytoken_api_keys = ['AKIA-WMT-POS-9X82', 'WMT-SC-XYZ123']
 
     def fit(self, df: pd.DataFrame):
         """Establish baselines from normal behavior."""
@@ -448,7 +450,7 @@ class StatisticalAnomalyDetector:
         file_access = df['event_type'].str.contains('file', case=False, na=False)
         scores[is_night & file_access] = 0.6
 
-        sensitive_patterns = ['passwd', 'shadow', '/etc/', 'credentials', 'keys']
+        sensitive_patterns = ['passwd', 'shadow', '/etc/', 'credentials', 'keys', 'wmt_pos_master', 'supply_chain_auth', 'customer_pii_export']
         for pattern in sensitive_patterns:
             sensitive_mask = df['message'].str.contains(pattern, case=False, na=False)
             scores[sensitive_mask] = np.maximum(scores[sensitive_mask], 0.7)
@@ -471,14 +473,28 @@ class StatisticalAnomalyDetector:
 
         return scores
 
+    def detect_honeytoken_usage(self, df: pd.DataFrame) -> np.ndarray:
+        """Detect any usage of known honeytokens (accounts or keys)."""
+        scores = np.zeros(len(df))
+        
+        for h_user in self.honeytoken_users:
+            scores[df['user'] == h_user] = 1.0
+            
+        for h_key in self.honeytoken_api_keys:
+            key_mask = df['message'].str.contains(h_key, case=False, na=False)
+            scores[key_mask] = 1.0
+            
+        return scores
+
     def detect_all(self, df: pd.DataFrame) -> np.ndarray:
         """Run all detectors and combine scores."""
         bf_scores = self.detect_brute_force(df)
         pe_scores = self.detect_privilege_escalation(df)
         de_scores = self.detect_data_exfiltration(df)
         lm_scores = self.detect_lateral_movement(df)
+        ht_scores = self.detect_honeytoken_usage(df)
 
-        combined = np.maximum.reduce([bf_scores, pe_scores, de_scores, lm_scores])
+        combined = np.maximum.reduce([bf_scores, pe_scores, de_scores, lm_scores, ht_scores])
         return combined
 
 
@@ -544,13 +560,15 @@ def classify_threat_type(df: pd.DataFrame, stat_detector: StatisticalAnomalyDete
     pe_scores = stat_detector.detect_privilege_escalation(df)
     de_scores = stat_detector.detect_data_exfiltration(df)
     lm_scores = stat_detector.detect_lateral_movement(df)
+    ht_scores = stat_detector.detect_honeytoken_usage(df)
 
     for i in range(len(df)):
         scores = {
             'brute_force': bf_scores[i],
             'privilege_escalation': pe_scores[i],
             'data_exfiltration': de_scores[i],
-            'lateral_movement': lm_scores[i]
+            'lateral_movement': lm_scores[i],
+            'honeytoken_usage': ht_scores[i]
         }
 
         if max(scores.values()) > 0:
