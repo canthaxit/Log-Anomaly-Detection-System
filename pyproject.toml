@@ -18,14 +18,17 @@ omit = [
     "core/intrusion_detection_pipeline.py",
     "api/anomaly_api_chronicle.py",
     "api/test_api.py",
-    "mcp/anomaly_mcp_server.py",
+    "core/autoencoder.py",
 ]
 
 [tool.coverage.report]
-fail_under = 55
+fail_under = 90
 show_missing = true
 exclude_lines = [
     "if __name__",
     "pragma: no cover",
     "exit\\(1\\)",
+    "uvicorn\\.run",
+    "asyncio\\.run",
+    "print\\(.*Install with",
 ]

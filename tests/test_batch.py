@@ -1,5 +1,6 @@
 """Tests for batch/batch_processor.py."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -80,3 +81,213 @@ class TestBatchLoadModels:
             assert bp.threshold is not None
         finally:
             sec.ALLOWED_MODEL_DIRS.remove(str(model_dir))
+
+
+class TestBatchFindNewFiles:
+    def test_finds_json_files(self, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        (log_dir / "test.json").write_text('[{"test": true}]')
+
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            files = bp.find_new_files()
+            assert len(files) >= 1
+        finally:
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+    def test_skips_already_processed(self, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        f = log_dir / "test.json"
+        f.write_text('[{"test": true}]')
+
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            bp.processed_files.add(str(f))
+            files = bp.find_new_files()
+            assert len(files) == 0
+        finally:
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+
+class TestBatchProcessBatch:
+    def test_no_new_files_returns_zero(self, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "emptylogs"
+        log_dir.mkdir()
+
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            result = bp.process_batch()
+            assert result["processed"] == 0
+        finally:
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+
+class TestBatchLoadProcessedFiles:
+    def test_loads_existing_processed_list(self, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        # Create a processed_files.txt
+        (out_dir / "processed_files.txt").write_text("file1.json\nfile2.json\n")
+
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                log_dir=str(log_dir),
+                output_dir=str(out_dir),
+            )
+            assert "file1.json" in bp.processed_files
+            assert "file2.json" in bp.processed_files
+        finally:
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+    def test_save_processed_file(self, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        out_dir = tmp_path / "out"
+
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                log_dir=str(log_dir),
+                output_dir=str(out_dir),
+            )
+            bp.save_processed_file("test_file.json")
+            assert "test_file.json" in bp.processed_files
+            content = (out_dir / "processed_files.txt").read_text()
+            assert "test_file.json" in content
+        finally:
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+
+class TestBatchProcessFileWithModels:
+    def test_process_file_success(self, model_dir, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        # Read test log data and write to a file
+        test_logs = Path(__file__).parent / "test_logs_normal.json"
+        log_data = test_logs.read_text()
+        log_file = log_dir / "test_normal.json"
+        log_file.write_text(log_data)
+
+        sec.ALLOWED_MODEL_DIRS.append(str(model_dir))
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                model_dir=str(model_dir),
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            bp.load_models()
+            result = bp.process_file(log_file)
+            assert result["status"] == "success"
+            assert result["total_events"] > 0
+        finally:
+            sec.ALLOWED_MODEL_DIRS.remove(str(model_dir))
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+    def test_process_file_empty(self, model_dir, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        log_file = log_dir / "empty.json"
+        log_file.write_text("[]")
+
+        sec.ALLOWED_MODEL_DIRS.append(str(model_dir))
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                model_dir=str(model_dir),
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            bp.load_models()
+            result = bp.process_file(log_file)
+            assert result["status"] == "empty"
+        finally:
+            sec.ALLOWED_MODEL_DIRS.remove(str(model_dir))
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+
+class TestBatchProcessBatchWithFiles:
+    def test_process_batch_with_files(self, model_dir, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+        test_logs = Path(__file__).parent / "test_logs_normal.json"
+        log_file = log_dir / "test_batch.json"
+        log_file.write_text(test_logs.read_text())
+
+        sec.ALLOWED_MODEL_DIRS.append(str(model_dir))
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                model_dir=str(model_dir),
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            bp.load_models()
+            result = bp.process_batch()
+            assert result["processed"] >= 1
+            assert "results" in result
+        finally:
+            sec.ALLOWED_MODEL_DIRS.remove(str(model_dir))
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))
+
+
+class TestBatchLoadModelsFailure:
+    def test_load_models_invalid_dir(self, tmp_path):
+        from batch.batch_processor import BatchProcessor
+        import common.security as sec
+
+        log_dir = tmp_path / "testlogs"
+        log_dir.mkdir()
+
+        sec.ALLOWED_LOG_DIRS.append(str(log_dir))
+        try:
+            bp = BatchProcessor(
+                model_dir="anomaly_outputs/nonexistent_xyz",
+                log_dir=str(log_dir),
+                output_dir=str(tmp_path / "out"),
+            )
+            result = bp.load_models()
+            assert result is False
+        finally:
+            sec.ALLOWED_LOG_DIRS.remove(str(log_dir))

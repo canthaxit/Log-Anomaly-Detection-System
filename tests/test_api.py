@@ -121,3 +121,108 @@ class TestStatsEndpoint:
         body = resp.json()
         assert body["models_loaded"] is True
         assert "threshold" in body
+
+
+class TestAnalyzeEndpointEdgeCases:
+    def test_models_not_loaded_returns_400(self, api_app, client):
+        from api.anomaly_api import MODEL_STATE
+        orig = MODEL_STATE["loaded"]
+        MODEL_STATE["loaded"] = False
+        try:
+            resp = client.post("/analyze", json={"logs": [
+                {"timestamp": "2026-01-01T00:00:00Z", "user": "a",
+                 "source_ip": "1.1.1.1", "event_type": "login",
+                 "action": "success", "message": "m"}
+            ]})
+            assert resp.status_code == 400
+        finally:
+            MODEL_STATE["loaded"] = orig
+
+    def test_return_all_events_flag(self, client):
+        logs = [
+            {"timestamp": "2026-01-01T00:00:00Z", "user": "alice",
+             "source_ip": "1.1.1.1", "event_type": "login",
+             "action": "success", "message": "normal log", "severity": "low"}
+        ]
+        resp = client.post("/analyze", json={"logs": logs, "return_all_events": True})
+        assert resp.status_code == 200
+
+
+class TestStatsNotLoaded:
+    def test_stats_not_loaded_returns_400(self, api_app, client):
+        from api.anomaly_api import MODEL_STATE
+        orig = MODEL_STATE["loaded"]
+        MODEL_STATE["loaded"] = False
+        try:
+            resp = client.get("/stats")
+            assert resp.status_code == 400
+        finally:
+            MODEL_STATE["loaded"] = orig
+
+
+class TestModelLoadEndpoint:
+    def test_invalid_model_dir_returns_403(self, client):
+        resp = client.post("/models/load?model_dir=/tmp/evil")
+        assert resp.status_code == 403
+
+    def test_nonexistent_dir_returns_404(self, client):
+        resp = client.post("/models/load?model_dir=anomaly_outputs/nonexistent")
+        assert resp.status_code in (403, 404, 500)
+
+
+class TestAnalyzeFileNotLoaded:
+    def test_file_upload_not_loaded_returns_400(self, api_app, client):
+        from api.anomaly_api import MODEL_STATE
+        from io import BytesIO
+        orig = MODEL_STATE["loaded"]
+        MODEL_STATE["loaded"] = False
+        try:
+            resp = client.post(
+                "/analyze/file",
+                files={"file": ("test.json", BytesIO(b"[]"), "application/json")},
+            )
+            assert resp.status_code == 400
+        finally:
+            MODEL_STATE["loaded"] = orig
+
+
+class TestModelsInfoNotLoaded:
+    def test_models_info_not_loaded(self, api_app, client):
+        from api.anomaly_api import MODEL_STATE
+        orig = MODEL_STATE["loaded"]
+        MODEL_STATE["loaded"] = False
+        try:
+            resp = client.get("/models/info")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["loaded"] is False
+        finally:
+            MODEL_STATE["loaded"] = orig
+
+
+class TestModelLoadSuccess:
+    def test_load_models_success(self, api_app, client, model_dir):
+        import common.security as sec
+        sec.ALLOWED_MODEL_DIRS.append(str(model_dir))
+        try:
+            resp = client.post(f"/models/load?model_dir={model_dir}")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["status"] == "success"
+        finally:
+            sec.ALLOWED_MODEL_DIRS.remove(str(model_dir))
+
+
+class TestAnalyzeEmptyLogs:
+    def test_empty_df_after_preprocess(self, client):
+        """Test with logs that become empty after preprocessing (all invalid timestamps)."""
+        logs = [
+            {"timestamp": "not-a-date", "user": "alice",
+             "source_ip": "1.1.1.1", "event_type": "login",
+             "action": "success", "message": "m"}
+        ]
+        resp = client.post("/analyze", json={"logs": logs})
+        # Should succeed with 0 events (invalid timestamps removed)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_events"] == 0
