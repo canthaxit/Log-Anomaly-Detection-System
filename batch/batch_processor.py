@@ -8,6 +8,7 @@ import os
 import time
 import json
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any
@@ -29,6 +30,9 @@ _parent = os.path.join(os.path.dirname(__file__), '..')
 if os.path.isfile(os.path.join(_parent, 'common', 'security.py')):
     sys.path.insert(0, _parent)
 from common.security import validate_model_path, validate_log_path, verify_model_file
+from common.threats import ThreatClassifier
+from common.sanitize import sanitize_message
+from common.config import DEFAULT_THRESHOLD
 
 # Configure logging
 logging.basicConfig(
@@ -67,6 +71,8 @@ class BatchProcessor:
         self.threshold = None
 
         self.processed_files = set()
+        self._model_lock = threading.Lock()
+        self._classifier = ThreatClassifier()
         self.load_processed_files()
 
     def load_processed_files(self):
@@ -87,20 +93,21 @@ class BatchProcessor:
         """Load trained models."""
         try:
             self.model_dir = validate_model_path(str(self.model_dir))
-            for pkl in ("feature_pipeline.pkl", "isolation_forest_model.pkl", "statistical_detector.pkl"):
-                verify_model_file(self.model_dir / pkl)
-            self.feature_pipeline = joblib.load(self.model_dir / "feature_pipeline.pkl")
-            self.isolation_forest = joblib.load(self.model_dir / "isolation_forest_model.pkl")
-            self.statistical_detector = joblib.load(self.model_dir / "statistical_detector.pkl")
+            with self._model_lock:
+                for pkl in ("feature_pipeline.pkl", "isolation_forest_model.pkl", "statistical_detector.pkl"):
+                    verify_model_file(self.model_dir / pkl)
+                self.feature_pipeline = joblib.load(self.model_dir / "feature_pipeline.pkl")
+                self.isolation_forest = joblib.load(self.model_dir / "isolation_forest_model.pkl")
+                self.statistical_detector = joblib.load(self.model_dir / "statistical_detector.pkl")
 
-            if (self.model_dir / "inference_package.pkl").exists():
-                verify_model_file(self.model_dir / "inference_package.pkl")
-                package = joblib.load(self.model_dir / "inference_package.pkl")
-                self.scorer = package.get("scorer")
-                self.threshold = package.get("threshold")
-            else:
-                self.scorer = AnomalyScorer()
-                self.threshold = 0.7
+                if (self.model_dir / "inference_package.pkl").exists():
+                    verify_model_file(self.model_dir / "inference_package.pkl")
+                    package = joblib.load(self.model_dir / "inference_package.pkl")
+                    self.scorer = package.get("scorer")
+                    self.threshold = package.get("threshold")
+                else:
+                    self.scorer = AnomalyScorer()
+                    self.threshold = DEFAULT_THRESHOLD
 
             logger.info(f"Models loaded successfully from {self.model_dir}")
             return True
@@ -127,6 +134,15 @@ class BatchProcessor:
     def process_file(self, filepath: Path) -> Dict[str, Any]:
         """Process a single log file."""
         try:
+            with self._model_lock:
+                snap = {
+                    "feature_pipeline": self.feature_pipeline,
+                    "isolation_forest": self.isolation_forest,
+                    "statistical_detector": self.statistical_detector,
+                    "scorer": self.scorer,
+                    "threshold": self.threshold,
+                }
+
             logger.info(f"Processing: {filepath}")
 
             # Parse log file
@@ -141,20 +157,20 @@ class BatchProcessor:
             df = preprocess_logs(df)
 
             # Extract features
-            features = self.feature_pipeline.transform(df)
+            features = snap["feature_pipeline"].transform(df)
 
             # Detect anomalies
-            iso_scores = -self.isolation_forest.score_samples(features)
-            stat_scores = self.statistical_detector.detect_all(df)
+            iso_scores = -snap["isolation_forest"].score_samples(features)
+            stat_scores = snap["statistical_detector"].detect_all(df)
 
             # Combine scores
-            combined_scores = self.scorer.combine_scores({
+            combined_scores = snap["scorer"].combine_scores({
                 'isolation_forest': iso_scores,
                 'statistical': stat_scores
             })
 
             # Identify anomalies
-            is_anomaly = combined_scores > self.threshold
+            is_anomaly = combined_scores > snap["threshold"]
 
             # Build result
             anomalies_df = df[is_anomaly].copy()
@@ -162,12 +178,12 @@ class BatchProcessor:
 
             # Classify threats
             anomalies_df['threat_type'] = anomalies_df.apply(
-                self.classify_threat, axis=1
+                self._classifier.classify_threat, axis=1
             )
 
             # Assign severity
             anomalies_df['severity'] = anomalies_df['anomaly_score'].apply(
-                self.assign_severity
+                self._classifier.assign_severity
             )
 
             # Save results
@@ -180,7 +196,7 @@ class BatchProcessor:
                 "total_events": len(df),
                 "anomalies_detected": len(anomalies_df),
                 "anomaly_rate": len(anomalies_df) / len(df),
-                "threshold": float(self.threshold),
+                "threshold": float(snap["threshold"]),
                 "anomalies": anomalies_df.to_dict(orient='records')
             }
 
@@ -188,6 +204,8 @@ class BatchProcessor:
             for anomaly in result["anomalies"]:
                 if 'timestamp' in anomaly and hasattr(anomaly['timestamp'], 'isoformat'):
                     anomaly['timestamp'] = anomaly['timestamp'].isoformat()
+                if 'message' in anomaly:
+                    anomaly['message'] = sanitize_message(str(anomaly['message']))
 
             with open(output_file, 'w') as f:
                 json.dump(result, f, indent=2)
@@ -209,30 +227,6 @@ class BatchProcessor:
         except Exception as e:
             logger.error(f"Failed to process {filepath}: {e}", exc_info=True)
             return {"status": "error", "filepath": str(filepath), "error": "Processing failed"}
-
-    def classify_threat(self, row: pd.Series) -> str:
-        """Classify threat type."""
-        if 'failed' in str(row.get('action', '')).lower():
-            return 'brute_force'
-        elif 'sudo' in str(row.get('message', '')).lower():
-            return 'privilege_escalation'
-        elif any(word in str(row.get('message', '')).lower() for word in ['shadow', 'passwd', 'secret']):
-            return 'data_exfiltration'
-        elif row.get('event_type') == 'network':
-            return 'lateral_movement'
-        else:
-            return 'unknown'
-
-    def assign_severity(self, score: float) -> str:
-        """Assign severity based on score."""
-        if score >= 0.95:
-            return 'critical'
-        elif score >= 0.85:
-            return 'high'
-        elif score >= 0.7:
-            return 'medium'
-        else:
-            return 'low'
 
     def process_batch(self) -> Dict[str, Any]:
         """Process all new files."""
