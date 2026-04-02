@@ -38,6 +38,11 @@ _parent = os.path.join(os.path.dirname(__file__), '..')
 if os.path.isfile(os.path.join(_parent, 'common', 'security.py')):
     sys.path.insert(0, _parent)
 from common.security import validate_model_path, validate_log_path, verify_model_file
+from common.config import MAX_INPUT_SIZE, MAX_LOG_EVENTS, MAX_CSV_COLUMNS, DEFAULT_THRESHOLD
+from common.threats import ThreatClassifier
+from common.sanitize import sanitize_message
+
+_classifier = ThreatClassifier()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,11 +50,6 @@ logger = logging.getLogger("anomaly-mcp-server")
 
 # Initialize MCP server
 app = Server("log-anomaly-detection")
-
-# Input size limits
-MAX_INPUT_SIZE = 10 * 1024 * 1024  # 10 MB
-MAX_LOG_EVENTS = 10_000
-MAX_CSV_COLUMNS = 50
 
 # Global state for loaded models
 MODEL_STATE = {
@@ -85,7 +85,7 @@ def load_models(model_dir: str = "anomaly_outputs") -> Dict[str, Any]:
             MODEL_STATE["threshold"] = package.get("threshold")
         else:
             MODEL_STATE["scorer"] = AnomalyScorer()
-            MODEL_STATE["threshold"] = 0.7
+            MODEL_STATE["threshold"] = DEFAULT_THRESHOLD
 
         MODEL_STATE["loaded"] = True
         logger.info(f"Models loaded successfully from {model_dir}")
@@ -154,12 +154,11 @@ def analyze_logs(log_data: str, format: str = "json") -> Dict[str, Any]:
 
         # Classify threats
         anomalies_df['threat_type'] = anomalies_df.apply(
-            lambda row: classify_threat(row, MODEL_STATE["statistical_detector"]),
-            axis=1
+            _classifier.classify_threat, axis=1
         )
-
-        # Assign severity
-        anomalies_df['severity'] = anomalies_df['anomaly_score'].apply(assign_severity)
+        anomalies_df['severity'] = anomalies_df['anomaly_score'].apply(
+            _classifier.assign_severity
+        )
 
         # Convert to JSON-serializable format
         anomalies = anomalies_df.to_dict(orient='records')
@@ -168,6 +167,8 @@ def analyze_logs(log_data: str, format: str = "json") -> Dict[str, Any]:
         for anomaly in anomalies:
             if 'timestamp' in anomaly and hasattr(anomaly['timestamp'], 'isoformat'):
                 anomaly['timestamp'] = anomaly['timestamp'].isoformat()
+            if 'message' in anomaly:
+                anomaly['message'] = sanitize_message(str(anomaly['message']))
 
         return {
             "status": "success",
@@ -181,33 +182,6 @@ def analyze_logs(log_data: str, format: str = "json") -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Analysis failed: {e}", exc_info=True)
         return {"status": "error", "message": "Analysis failed"}
-
-
-def classify_threat(row: pd.Series, detector: StatisticalAnomalyDetector) -> str:
-    """Classify threat type for a single anomaly."""
-    # Simple heuristic based on log attributes
-    if 'failed' in str(row.get('action', '')).lower():
-        return 'brute_force'
-    elif 'sudo' in str(row.get('message', '')).lower():
-        return 'privilege_escalation'
-    elif 'shadow' in str(row.get('message', '')).lower() or 'passwd' in str(row.get('message', '')).lower():
-        return 'data_exfiltration'
-    elif row.get('event_type') == 'network':
-        return 'lateral_movement'
-    else:
-        return 'unknown'
-
-
-def assign_severity(score: float) -> str:
-    """Assign severity based on anomaly score."""
-    if score >= 0.95:
-        return 'critical'
-    elif score >= 0.85:
-        return 'high'
-    elif score >= 0.7:
-        return 'medium'
-    else:
-        return 'low'
 
 
 def analyze_log_file(filepath: str) -> Dict[str, Any]:
