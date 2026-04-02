@@ -5,6 +5,8 @@ services:
   anomaly-api:
     build: .
     container_name: anomaly-detection-api
+    # IMPORTANT: Use a reverse proxy (nginx/Caddy) for TLS in production.
+    # See README.md "Production Deployment" section.
     ports:
       - "8000:8000"
     volumes:

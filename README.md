@@ -220,3 +220,59 @@ MIT License - see [LICENSE](LICENSE) for details.
 ---
 
 **Detect threats before they become incidents.** 🛡️
+
+## Production Deployment
+
+### TLS / HTTPS
+
+The API server binds to `127.0.0.1:8000` with plain HTTP by default. For production, use a reverse proxy for TLS termination.
+
+#### nginx
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name anomaly-api.example.com;
+
+    ssl_certificate     /etc/ssl/certs/anomaly-api.crt;
+    ssl_certificate_key /etc/ssl/private/anomaly-api.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+#### Caddy
+
+```
+anomaly-api.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+Caddy handles TLS certificates automatically via Let's Encrypt.
+
+### Authentication
+
+API authentication is **required by default**. Set the `API_KEY` environment variable before starting:
+
+```bash
+export API_KEY="your-secure-api-key"
+python api/anomaly_api.py
+```
+
+To explicitly disable auth (development only):
+
+```bash
+export REQUIRE_AUTH=false
+python api/anomaly_api.py
+```
+
+### Docker
+
+The `docker-compose.yml` binds the API to port 8000. Place a reverse proxy in front for TLS. See `docker/docker-compose.yml` for the full configuration.
