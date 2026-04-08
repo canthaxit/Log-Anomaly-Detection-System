@@ -117,7 +117,7 @@ def verify_model_file(filepath: str | Path) -> None:
 # ---------------------------------------------------------------------------
 
 API_KEY: str | None = os.environ.get("API_KEY")
-REQUIRE_AUTH: bool = os.environ.get("REQUIRE_AUTH", "false").lower() == "true"
+REQUIRE_AUTH: bool = os.environ.get("REQUIRE_AUTH", "true").lower() == "true"
 
 if API_KEY is None:
     if REQUIRE_AUTH:
