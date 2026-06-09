@@ -25,6 +25,9 @@ for _p in [str(_project_root), str(_core_dir)]:
 # Set env vars BEFORE importing security (it reads them at import time)
 os.environ.setdefault("ALLOWED_MODEL_DIRS", "anomaly_outputs,tests/tmp_models")
 os.environ.setdefault("ALLOWED_LOG_DIRS", "logs,tests")
+# REQUIRE_AUTH defaults to true (fail-closed); the suite has no API_KEY and
+# exercises auth by patching security.API_KEY directly, so disable it here.
+os.environ.setdefault("REQUIRE_AUTH", "false")
 
 # Now safe to import project modules
 from log_anomaly_detection_lite import (
