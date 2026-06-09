@@ -16,6 +16,8 @@ asyncio_mode = "auto"
 source = ["core", "common", "api", "batch", "mcp"]
 omit = [
     "core/intrusion_detection_pipeline.py",
+    "core/generate_chat_training_data.py",
+    "core/train_chat_classifier.py",
     "api/anomaly_api_chronicle.py",
     "api/test_api.py",
     "mcp/anomaly_mcp_server.py",
