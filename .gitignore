@@ -208,3 +208,6 @@ desktop.ini
 
 # Git worktrees
 .worktrees/
+
+# chat-classifier trained models (regenerate via core/train_chat_classifier.py)
+anomaly_outputs/*.pkl
